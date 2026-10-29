@@ -1,0 +1,8 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        http-kit/http-kit {:mvn/version "2.8.0"}
+        org.clojure/data.json {:mvn/version "2.5.1"}}
+ :aliases
+ {:demo {:main-opts ["-m" "caution.demo"]}
+  :test {:extra-paths ["test"]
+         :main-opts ["-m" "caution.test-runner"]}}}
