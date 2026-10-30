@@ -6,6 +6,7 @@
    :on-toggle       "toggle"
    :on-input        "input"
    :on-commit       "commit"
+   :on-submit       "submit"
    :on-select       "select"
    :on-dismiss      "dismiss"
    :on-sort         "sort"

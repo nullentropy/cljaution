@@ -1,5 +1,6 @@
 (ns caution.server
   (:require [caution.session :as sess]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [org.httpkit.server :as hk]))
@@ -13,6 +14,14 @@
        "canvas{display:block;width:100vw;height:100vh}"
        "</style></head><body><canvas id=\"root\"></canvas>"
        "<script type=\"module\" src=\"/app.js\"></script></body></html>\n"))
+
+(defn host-page-handler
+  "The page that boots the browser terminal. Route \"/\" to your own handler
+  to gate the page load, then hand off to this"
+  [_req]
+  {:status 200
+   :headers {"Content-Type" "text/html; charset=utf-8"}
+   :body host-page})
 
 (defn- query-params [req]
   (into {}
@@ -100,14 +109,24 @@
 
 ;; -- websocket ------------------------------------------------------------------------
 
-(defn- ws-handler [{:keys [view init authorize allowed-origins on-mount on-close]} req]
+(defn- deny
+  "A browser can't see the status of a failed upgrade, so a plain 403 reads
+  as an outage it retries forever. Upgrade, say why, hang up"
+  [req]
+  (hk/as-channel req
+    {:on-open (fn [ch]
+                (hk/send! ch (json/write-str {"t" "denied"}))
+                (hk/close ch))}))
+
+(defn- ws-handler [{:keys [view init authorize allowed-origins on-mount on-close
+                           resume-grace-ms]} req]
   (if-not (same-origin? req allowed-origins)
     {:status 403 :body "forbidden"}
     (let [identity (try (when authorize (authorize req))
                         (catch Throwable t {::denied (.getMessage t)}))]
       (if (and (map? identity) (::denied identity))
         (do (println "caution: connection rejected:" (::denied identity))
-            {:status 403 :body "forbidden"})
+            (deny req))
         (let [params (query-params req)
               vw (num-param params "vw")
               vh (num-param params "vh")
@@ -122,7 +141,8 @@
                         (println "caution: resume denied - identity mismatch"))
                       (sess/new-session {:view view :init init :identity identity
                                          :request req :vw vw :vh vh
-                                         :on-mount on-mount :on-close on-close})))]
+                                         :on-mount on-mount :on-close on-close
+                                         :resume-grace-ms resume-grace-ms})))]
           (hk/as-channel req
             {:on-open    (fn [ch]
                            (println (format "caution: session %d connected (%s)"
@@ -151,9 +171,7 @@
         (or (when-let [h (get routes uri)] (h req))
             (some (fn [[prefix h]] (when (str/starts-with? uri prefix) (h req))) statics)
             (case uri
-              "/"       {:status 200
-                         :headers {"Content-Type" "text/html; charset=utf-8"}
-                         :body host-page}
+              "/"       (host-page-handler req)
               "/app.js" (bundle req)
               "/term.wasm" (wasm-handler req)
               "/ws"     (ws-handler opts req)
@@ -166,6 +184,7 @@
             :init (fn [] {:count 0})        ; initial per-session state
             :view (fn [state session] ...)  ; pure: state -> hiccup tree
             :authorize (fn [req] identity)  ; optional; throw to reject
+            :resume-grace-ms 60000
             :routes {\"/health\" (fn [_] {:status 200 :body \"ok\"})}
             :static {\"/assets/\" \"assets\"}})
 

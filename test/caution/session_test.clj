@@ -172,3 +172,89 @@
     (is (= 200 (:status plain)))
     (is (nil? (get-in plain [:headers "Content-Encoding"])))
     (is (= [0x00 0x61 0x73 0x6d] (magic plain 4)) "wasm magic bytes")))
+
+(deftest cookies-ride-the-mount-and-wait-out-a-disconnect
+  (let [sent (atom [])
+        base {:sid 0 :tree {:id 1 :type "panel" :props {} :kids []}
+              :seq 3 :index {} :ranges {} :rows-cache {} :!state (atom {})}
+        attach! #'caution.session/open!]
+    (with-redefs [caution.session/send-json! (fn [s msg]
+                                               (when (:channel @s)
+                                                 (swap! sent conj msg)
+                                                 true))
+                  caution.session/post! (fn [_ _ f] (f))]
+      (testing "live: one cookie op per cookie"
+        (let [sess (atom (assoc base :channel :ch))]
+          (c/set-cookie! sess {:name "login" :value "abc" :max-age 60 :same-site :lax})
+          (is (= [{"t" "patch" "seq" 4
+                   "ops" [{"op" "cookie"
+                           "cookie" "login=abc; Path=/; Max-Age=60; SameSite=Lax"}]}]
+                 @sent))
+          (is (empty? (:cookies @sess)))))
+
+      (testing "disconnected: held, seq untouched, sent after the resume ack"
+        (reset! sent [])
+        (let [sess (atom base)]
+          (c/set-cookie! sess {:name "login" :value "" :max-age -1})
+          (is (= 3 (:seq @sess)) "a resume ack must still match")
+          (attach! sess :ch 3)
+          (is (= [{"t" "resume" "seq" 3}
+                  {"t" "patch" "seq" 4
+                   "ops" [{"op" "cookie" "cookie" "login=; Path=/; Max-Age=0"}]}]
+                 @sent))))
+
+      (testing "a remount carries pending cookies"
+        (reset! sent [])
+        (let [sess (atom (assoc base :cookies ["a=1; Path=/"]))]
+          (attach! sess :ch 1)
+          (is (= ["a=1; Path=/"] (get (first @sent) "cookies")))
+          (is (empty? (:cookies @sess)))))
+
+      (testing "invalid names and values are dropped"
+        (let [sess (atom base)]
+          (c/set-cookie! sess {:name "bad name" :value "x"})
+          (c/set-cookie! sess {:name "ok" :value "has;semicolon"})
+          (is (empty? (:cookies @sess))))))))
+
+(deftest motion-rides-the-mount
+  (let [sent (atom [])]
+    (with-redefs [caution.session/send-json! (fn [_ msg] (swap! sent conj msg) true)
+                  caution.session/post! (fn [_ _ f] (f))]
+      (let [sess (atom {:sid 0 :tree {:id 1 :type "panel" :props {} :kids []}
+                        :seq 0 :index {} :ranges {} :rows-cache {} :!state (atom {})})]
+        (c/set-motion! sess :reduced)
+        (is (= {"op" "motion" "motion" "reduced"} (first (get (first @sent) "ops"))))
+        (#'caution.session/open! sess :ch nil)
+        (is (= "reduced" (get (last @sent) "motion")))))
+    (is (true? (get-in (c/normalize [:scroll {:no-fade true}]) [:props "noFade"])))))
+
+(deftest close-session-ends-it-for-good
+  (let [closed (atom nil)
+        sess (caution.session/new-session {:view (fn [_ _] [:panel {}])})]
+    (swap! sess assoc :channel :ch)
+    (with-redefs [org.httpkit.server/close (fn [ch] (reset! closed ch))]
+      (c/close-session! sess))
+    (is (= :ch @closed) "the socket is hung up")
+    (is (not (c/alive? sess)))
+    (is (nil? (caution.session/lookup (:token @sess))) "a reconnect can't resume it")))
+
+(deftest cookie-reads-the-request-header
+  (let [req {:headers {"cookie" "a=1; login=abc=def; b=2"}}]
+    (is (= "abc=def" (c/cookie req "login")))
+    (is (nil? (c/cookie req "missing")))
+    (is (nil? (c/cookie {:headers {}} "login")))))
+
+(deftest submit-repeats-and-focus-reaches-the-handler
+  (let [!state (atom {:sent [] :focus []})
+        r (render-step nil 1 [:panel {}
+                              [:textfield {:on-submit (fn [s v] (update s :sent conj v))}]])
+        id (:id (first (:kids (:tree r))))
+        sess (session-shell r !state)]
+    (swap! sess assoc :focus-handler (fn [s f] (update s :focus conj f)))
+    (is (= ["submit"] (get-in (:index r) [id :props "on"])))
+    (dispatch! sess {"id" id "ev" "submit" "value" "hi"})
+    (dispatch! sess {"id" id "ev" "submit" "value" "hi"})
+    (dispatch! sess {"id" 0 "ev" "focus" "value" false})
+    (is (= ["hi" "hi"] (:sent @!state)) "every enter sends, changed or not")
+    (is (= [false] (:focus @!state)))
+    (is (not (c/focused? sess)))))

@@ -2,11 +2,10 @@
   (:require [caution.diff :as d]
             [caution.wire :as w]
             [clojure.data.json :as json]
+            [clojure.string :as str]
             [org.httpkit.server :as hk])
   (:import [java.util.concurrent Executors ExecutorService TimeUnit
             ScheduledExecutorService]))
-
-(def ^:private resume-grace-ms 60000)
 
 (defonce ^:private registry (atom {}))      ; token -> session
 (defonce ^:private sid-counter (atom 0))
@@ -54,11 +53,13 @@
               (= cmd "value") (assoc "value" (get-in (index id) [:props "value"])))))
         cmds))
 
+(declare drop-sent-cookies!)
+
 (defn- send-mount! [sess]
   (let [m (swap! sess update :seq inc)
         focus (some->> (:focus-key m) (key-id (:tree m)))]
     (when debug? (log (format "session %d -> mount" (:sid m))))
-    (send-json! sess (cond-> {"t" "mount" "seq" (:seq m) "sid" (:token m)
+    (when (send-json! sess (cond-> {"t" "mount" "seq" (:seq m) "sid" (:token m)
                               "root" (w/->wire (:tree m))}
                        focus         (assoc "focus" focus)
                        (:theme m)    (assoc "theme" (:theme m))
@@ -67,12 +68,15 @@
                        (seq (:loops m)) (assoc "loops" (:loops m))
                        (:menu m)     (assoc "menu" (:menu m))
                        (:title m)    (assoc "title" (:title m))
+                       (:motion m)   (assoc "motion" (name (:motion m)))
+                       (seq (:cookies m)) (assoc "cookies" (:cookies m))
                        (:keys m)     (assoc "keys" (:keys m))
                        (or (:preloads m) (:sound-preloads m))
                        (assoc "resources"
                               (cond-> {}
                                 (:preloads m)       (assoc "images" (:preloads m))
-                                (:sound-preloads m) (assoc "sounds" (:sound-preloads m))))))))
+                                (:sound-preloads m) (assoc "sounds" (:sound-preloads m))))))
+      (drop-sent-cookies! sess (count (:cookies m))))))
 
 (defn- send-ops! [sess ops]
   (when (seq ops)
@@ -192,6 +196,54 @@
   (send-ops! sess [{"op" "metrics" "metrics" tokens}])
   nil)
 
+(defn set-motion!
+  "How much decorative motion the client plays (the insert fade, the reflow
+  slide, the theme crossfade): :system follows the OS reduce-motion
+  preference and is the default, :full and :reduced override it"
+  [sess motion]
+  (swap! sess assoc :motion motion)
+  (send-ops! sess [{"op" "motion" "motion" (name motion)}])
+  nil)
+
+;; -- cookies -----------------------------------------------------------------------
+
+(defn- drop-sent-cookies! [sess n]
+  (swap! sess update :cookies #(vec (drop n %))))
+
+;; unlike ops these wait out a disconnect, a resume can't rebuild them from
+;; the tree. the seq only moves when something is actually sent so a resume
+;; ack still matches
+(defn- flush-cookies! [sess]
+  (let [cs (:cookies @sess)]
+    (when (and (seq cs) (:channel @sess))
+      (let [m (swap! sess update :seq inc)
+            ops (mapv (fn [c] {"op" "cookie" "cookie" c}) cs)]
+        (when (send-json! sess {"t" "patch" "seq" (:seq m) "ops" ops})
+          (drop-sent-cookies! sess (count cs)))))))
+
+(defn- set-cookie-str [{:keys [name value path domain max-age secure same-site]}]
+  (let [name (kname name)
+        value (str value)]
+    (when (and (re-matches #"[!#$%&'*+\-.^_`|~0-9A-Za-z]+" name)
+               (re-matches #"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*" value))
+      (cond-> (str name "=" value "; Path=" (or path "/"))
+        domain    (str "; Domain=" domain)
+        max-age   (str "; Max-Age=" (max 0 max-age))
+        secure    (str "; Secure")
+        same-site (str "; SameSite=" (str/capitalize (kname same-site)))))))
+
+(defn set-cookie!
+  "Store a cookie on the client, kept by the browser or in a per-app file
+  natively and sent on every later connection, so the next session's
+  (request sess) and :authorize see it. c is {:name :value :max-age :path
+  :domain :secure :same-site}, a negative :max-age deletes. Path defaults to /"
+  [sess c]
+  (if-let [raw (set-cookie-str c)]
+    (do (swap! sess update :cookies (fnil conj []) raw)
+        (flush-cookies! sess))
+    (log (format "session %d dropped invalid cookie %s" (:sid @sess) (pr-str (:name c)))))
+  nil)
+
 (defn set-title!
   "Name the window: the browser tab's title, the native titlebar."
   [sess title]
@@ -283,6 +335,17 @@
   (swap! sess assoc :fullscreen-handler f)
   nil)
 
+(defn set-focus!
+  "Handle the client window gaining and losing focus, where f is
+  (fn [state focused?]). A hidden browser tab counts as unfocused"
+  [sess f]
+  (swap! sess assoc :focus-handler f)
+  nil)
+
+(defn focused?
+  "Last known client window focus, true until the client says otherwise"
+  [sess] (not (:unfocused @sess false)))
+
 (defn set-menu!
   "Replace the session's menu bar (a vector of menu maps; see
   caution.core/set-menu! for the shape)"
@@ -344,6 +407,7 @@
   {"toggle"       (fn [v] {"checked" v})
    "input"        (fn [v] {"value" v})
    "commit"       (fn [v] {"value" v})
+   "submit"       (fn [v] {"value" v})
    "select"       (fn [v] {"selected" v})
    ;; Keyed tables send {"row" i "key" k}, and selection identity is the key.
    "row-select"   (fn [v] (if (map? v)
@@ -382,6 +446,10 @@
                           (when-let [h (:fullscreen-handler @sess)]
                             (swap! (:!state @sess)
                                    (fn [s] (or (h s (boolean value)) s)))))
+        "focus"  (do (swap! sess assoc :unfocused (not value))
+                     (when-let [h (:focus-handler @sess)]
+                       (swap! (:!state @sess)
+                              (fn [s] (or (h s (boolean value)) s)))))
         nil)
 
       :else
@@ -416,7 +484,8 @@
          (fn []
            (cond
              (and client-seq (:tree @sess) (= client-seq (:seq @sess)))
-             (send-json! sess {"t" "resume" "seq" (:seq @sess)})
+             (do (send-json! sess {"t" "resume" "seq" (:seq @sess)})
+                 (flush-cookies! sess)) ; set while the client was away
 
              (:tree @sess)
              (do (send-mount! sess)                ; resume with changes: replay
@@ -444,13 +513,25 @@
 (defn close! [sess ch]
   (when (= ch (:channel @sess))
     (swap! sess assoc :channel nil :closed true)
-    (log (format "session %d disconnected - resumable for %ds"
-                 (:sid @sess) (quot resume-grace-ms 1000)))
+    (log (format "session %d disconnected - resumable for %dms"
+                 (:sid @sess) (:grace-ms @sess)))
     (.schedule timer ^Runnable (fn [] (expire! sess))
-               (long resume-grace-ms) TimeUnit/MILLISECONDS)))
+               (long (:grace-ms @sess)) TimeUnit/MILLISECONDS)))
+
+(defn close-session!
+  "End the session now. The client reconnects into a fresh session and a
+  fresh mount"
+  [sess]
+  (let [ch (:channel @sess)]
+    (swap! sess assoc :channel nil :closed true)
+    (expire! sess)
+    ;; after expire! drops it from the registry, so the client's reconnect
+    ;; finds nothing to resume
+    (some-> ch hk/close)
+    nil))
 
 (defn new-session
-  [{:keys [view init identity request vw vh on-mount on-close]}]
+  [{:keys [view init identity request vw vh on-mount on-close resume-grace-ms]}]
   (let [!state (atom (if (fn? init) (init) (or init {})))
         sess (atom {:sid      (swap! sid-counter inc)
                     :token    (str (java.util.UUID/randomUUID))
@@ -461,6 +542,7 @@
                     :vw       (or vw 0)
                     :vh       (or vh 0)
                     :on-close on-close
+                    :grace-ms (or resume-grace-ms 60000)
                     :tree     nil
                     :index    {}
                     :overlays []

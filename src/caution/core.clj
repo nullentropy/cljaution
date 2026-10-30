@@ -1,7 +1,8 @@
 (ns caution.core
   (:require [caution.server :as server]
             [caution.session :as session]
-            [caution.wire :as wire]))
+            [caution.wire :as wire]
+            [clojure.string :as str]))
 
 (def serve
   "Run a caution app. Returns a zero-arg fn that stops the server.
@@ -15,13 +16,17 @@
               checkout's `go run ./cmd/bundle` output; falls back to the
               caution/app.js on the classpath)
     :authorize (fn [req] identity) - runs on every connection including
-             resumes; throw to reject with 403. A resume only re-adopts a
+             resumes; throw to reject. A refused client shows \"access
+             denied\" and stops reconnecting. A resume only re-adopts a
              session whose identity matches.
+    :resume-grace-ms how long a disconnected session waits for its client
+             (default 60000)
     :allowed-origins  vector of allowed Origins (default: same-origin only,
              \"*\" for dev)
     :on-mount (fn [session]) - after a session is created (start tickers here)
     :on-close (fn [session]) - after it expires for good
-    :routes  {\"/path\" ring-handler}
+    :routes  {\"/path\" ring-handler}. A \"/\" route replaces the host
+             page, to gate the page load; hand off to host-page
     :static  {\"/prefix/\" \"directory\"}"
   server/serve)
 
@@ -51,12 +56,27 @@
    "space.pad" 13 "space.gap" 13})
 (def set-title!   "Name the window (browser tab title / native titlebar)."
   session/set-title!)
+(def set-motion!  "Decorative motion: :system (the OS preference, default),
+  :full or :reduced. A :no-fade prop drops the insert fade for a subtree."
+  session/set-motion!)
+(def set-cookie!  "Store a cookie on the client, sent on every later connection:
+  {:name \"login\" :value token :max-age 2592000}. A negative :max-age deletes.
+  Read it back with (cookie (request s) \"login\")."
+  session/set-cookie!)
+(def close-session! "End the session now. The client reconnects into a fresh
+  session and mount." session/close-session!)
+(def host-page    "Ring handler for the terminal's host page, for a custom \"/\" route."
+  server/host-page-handler)
 (def set-keys!    "Register session-wide shortcuts: [{:key \"cmd+j\" :handler f} ...]."
   session/set-keys!)
 (def set-aux!     "Handle mouse buttons 4 (back) and 5 (forward): (fn [state button])."
   session/set-aux!)
 (def set-fullscreen! "Handle entering/leaving system fullscreen: (fn [state on?])."
   session/set-fullscreen!)
+(def set-focus!   "Handle the window gaining/losing focus: (fn [state focused?])."
+  session/set-focus!)
+(def focused?     "Last known window focus, true until the client says otherwise."
+  session/focused?)
 (def preload!     "Warm client resource caches (images) ahead of first use."
   session/preload!)
 (def preload-sounds! "Decode WAV sources on the client ahead of their first play!."
@@ -74,6 +94,14 @@
   native terminal; picks run like any other handler. Rides mounts - set it
   in :on-mount and it arrives with the first paint."
   session/set-menu!)
+(defn cookie
+  "The value of cookie name on a ring request, or nil"
+  [req name]
+  (some (fn [pair]
+          (let [[k v] (str/split (str/trim pair) #"=" 2)]
+            (when (= k name) v)))
+        (some-> (get-in req [:headers "cookie"]) (str/split #";"))))
+
 (def identity-of  "Whatever :authorize returned for this session." session/identity-of)
 (def request      "The HTTP request that opened the session." session/request)
 (def viewport     "Client window size as [w h] logical px." session/viewport)
